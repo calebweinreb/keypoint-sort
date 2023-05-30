@@ -1,10 +1,10 @@
 import setuptools
 
-with open("README.md", 'r') as f:
+with open("README.md", 'r', encoding='utf-8') as f:
     long_description = f.read()
 
 setuptools.setup(
-    name='keypointSort',
+    name='keypoint-sort',
     version='0.0.0',
     author='Caleb Weinreb',
     author_email='calebsw@gmail.com',
@@ -15,7 +15,10 @@ setuptools.setup(
         'Programming Language :: Python :: 3',
         'Operating System :: OS Independent'
     ],
-    python_requires='>=3.7',
-    install_requires=['jax>=0.3'], 
-    url='https://github.com/calebweinreb/keypointSort'
+    python_requires='>=3.8',
+    install_requires=[
+        'jax>=0.3',
+        'networkx',
+    ], 
+    url='https://github.com/calebweinreb/keypoint-sort'
 )
