@@ -709,7 +709,8 @@ def format_sleap_paf_graph(node_order, parents, n_individuals,
 
 
 def sleap_infer_paf_graphs(video_path, model_path, node_order, 
-                           parents, n_individuals):
+                           parents, n_individuals, 
+                           peak_threshold=None, batch_size=None):
     """
     Infer PAF graphs from a video using a bottom-up SLEAP model.
 
@@ -732,6 +733,14 @@ def sleap_infer_paf_graphs(video_path, model_path, node_order,
     n_individuals : int
         Max instances of each bodyparts to keep per image.
 
+    peak_threshold : float, default=None
+        Minimum confidence of a peak to be considered a valid detection.
+        If None, the default threshold of the model will be used.
+
+    batch_size : int, default=None
+        Number of frames to process at a time. If None, the default
+        batch size of the model will be used.
+
     Returns
     -------
     coordinates: ndarray of shape (n_individuals, n_frames, n_bodyparts, 2)
@@ -751,7 +760,11 @@ def sleap_infer_paf_graphs(video_path, model_path, node_order,
     # load the sleap model
     predictor = load_model(model_path)
     predictor.inference_model.bottomup_layer.return_paf_graph = True
-    predictor.inference_model.bottomup_layer.peak_threshold = 0.02
+    
+    if batch_size is not None:
+        predictor.batch_size = batch_size
+    if peak_threshold is not None:
+        predictor.inference_model.bottomup_layer.peak_threshold = peak_threshold
 
     # initialize the video reader
     provider = VideoReader.from_filepath(filename=video_path)
