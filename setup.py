@@ -19,6 +19,7 @@ setuptools.setup(
     install_requires=[
         'jax>=0.3',
         'networkx',
+        'tqdm',
     ], 
     url='https://github.com/calebweinreb/keypoint-sort'
 )

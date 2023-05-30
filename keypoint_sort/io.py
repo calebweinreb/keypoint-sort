@@ -766,3 +766,4 @@ def sleap_infer_paf_graphs(video_path, model_path, node_order,
         
     coordinates, confidences, affinities = map(np.array, zip(*tracking_results))
     return coordinates, confidences, affinities
+
