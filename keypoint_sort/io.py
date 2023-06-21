@@ -462,10 +462,71 @@ def find_matching_videos(keys, video_dir, as_dict=False, recursive=True,
     else: return video_paths
 
 
+def save_detections_to_h5(filepath, coordinates, confidences, affinities, identities):
+    """
+    Save keypoint detections to an HDF5 file.
 
-def load_deeplabcut_detections(filepaths, bodyparts, node_order, parents, 
-                               individuals=None, recorded_individuals=None, 
-                               matched_frames=None, verbose=True, **kwargs):
+    Parameters
+    ----------
+    coordinates: ndarray of shape (n_individuals, n_frames, n_bodyparts, 2)
+        Coordinates of multi-animal keypoints detections.
+        
+    confidences: ndarray of shape (n_individuals, n_frames, n_bodyparts)
+        Confidences of multi-animal keypoints detections.
+        
+    affinities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts)
+        Part affinity field weights for each edge in the node hierarchy,
+        where `affinities[i,j,t,k]` is the weight from keypoint `[i,t,k]`
+        to keypoint `[j,t,parent(k)]`.
+            
+    identities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts)
+        Identity weights for each keypoint, where `identities[i,j,t,k]`
+        is the weight that keypoint `[i,t,k]` belongs to individual `j`.
+    """
+    with h5py.File(filepath, 'w') as f:
+        f.create_dataset('coordinates', data=coordinates)
+        f.create_dataset('confidences', data=confidences)
+        f.create_dataset('affinities', data=affinities)
+        f.create_dataset('identities', data=identities)
+
+
+def load_detections_from_h5(filepath):
+    """
+    Load keypoint detections from an HDF5 file.
+
+    Parameters
+    ----------
+    filepath: str
+        Path to an HDF5 file containing keypoint detections.
+
+    Returns
+    -------
+    coordinates: ndarray of shape (n_individuals, n_frames, n_bodyparts, 2)
+        Coordinates of multi-animal keypoints detections.
+        
+    confidences: ndarray of shape (n_individuals, n_frames, n_bodyparts)
+        Confidences of multi-animal keypoints detections.
+        
+    affinities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts)
+        Part affinity field weights for each edge in the node hierarchy,
+        where `affinities[i,j,t,k]` is the weight from keypoint `[i,t,k]`
+        to keypoint `[j,t,parent(k)]`.
+            
+    identities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts)
+        Identity weights for each keypoint, where `identities[i,j,t,k]`
+        is the weight that keypoint `[i,t,k]` belongs to individual `j`.
+    """
+    with h5py.File(filepath, 'r') as f:
+        coordinates = f['coordinates'][:]
+        confidences = f['confidences'][:]
+        affinities = f['affinities'][:]
+        identities = f['identities'][:]
+    return coordinates, confidences, affinities, identities
+
+
+def load_deeplabcut_full(filepath, bodyparts, node_order, parents, 
+                         individuals=None, recorded_individuals=None, 
+                         matched_frames=None, verbose=True, **kwargs):
     """
     Load multi-animal DeepLabCut results from a "_full.p" file.
 
@@ -477,12 +538,8 @@ def load_deeplabcut_detections(filepaths, bodyparts, node_order, parents,
 
     Parameters
     ----------
-    filepaths : str or list of str
-        Path(s) to the DeepLabCut results. For single-camera recordings,
-        this can be a string or a list with a single element. For
-        multi-camera recordings, this should be a list of strings. The
-        order of the filepaths should match the camera-order in the
-        calibration data that is used in subsequent processing.
+    filepath : str or list of str
+        Path to the DeepLabCut results. 
 
     bodyparts : list of str
         List of bodypart names.
@@ -503,33 +560,26 @@ def load_deeplabcut_detections(filepaths, bodyparts, node_order, parents,
     recorded_individuals : list of str, default=None
         Subset of individuals in the current recorded. Will only be
         used if `individuals` is specified as well.
-
-    matched_frames : ndarray of shape (num_frames,num_cameras), default=None
-        Array of time-matched indices for each camera. For example
-        `matched_frames[10,:]==[20,21]` would indicate that frame 20
-        from camera 0 and frame 21 from camera 1 correspond to the
-        were captured simultaneously. If None, it is assumed that
-        the frames are already matched across cameras.
     
     verbose : bool, default=True
         If True, print status updates and show progress bars.
 
     Returns
     -------
-    coordinates: ndarray of shape (n_individuals, n_frames, n_bodyparts, n_cameras, 2)
-        Coordinates of multi-animal keypoints detections from one or more cameras.
+    coordinates: ndarray of shape (n_individuals, n_frames, n_bodyparts, 2)
+        Coordinates of multi-animal keypoints detections.
         
-    confidences: ndarray of shape (n_individuals, n_frames, n_bodyparts, n_cameras)
-        Confidences of multi-animal keypoints detections from one or more cameras.
+    confidences: ndarray of shape (n_individuals, n_frames, n_bodyparts)
+        Confidences of multi-animal keypoints detections.
         
-    affinities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts, n_cameras)
+    affinities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts)
         Part affinity field weights for each edge in the node hierarchy,
-        where `affinities[i,j,t,k,c]` is the weight from keypoint `[i,t,k,c]`
-        to keypoint `[j,t,parent(k),c]`.
+        where `affinities[i,j,t,k]` is the weight from keypoint `[i,t,k]`
+        to keypoint `[j,t,parent(k)]`.
             
-    identities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts, n_cameras)
-        Identity weights for each keypoint, where `identities[i,j,t,k,c]`
-        is the weight that keypoint `[i,t,k,c]` belongs to individual `j`.
+    identities: ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts)
+        Identity weights for each keypoint, where `identities[i,j,t,k]`
+        is the weight that keypoint `[i,t,k]` belongs to individual `j`.
     """
     # initialize `recorded_individuals`
     if recorded_individuals is None: 
@@ -538,80 +588,110 @@ def load_deeplabcut_detections(filepaths, bodyparts, node_order, parents,
     else:
         id_channels = np.array([individuals.index(i) for i in recorded_individuals])
 
-    # initialize `filepaths`
-    if isinstance(filepaths, str): filepaths = [filepaths]
-
     # load data from each file
-    if verbose: print('Loading DeepLabCut files')
-    all_results = [pickle.load(open(fp, 'rb')) for fp in tqdm.tqdm(
-        filepaths, desc='Loading', disable=(not verbose or len(filepaths)==1))]
-    
-    # initialize `matched_frames`
-    num_frames = [r['metadata']['nframes'] for r in all_results]
-    assert len(set(num_frames))==1 or matched_frames is not None, fill(
-        'All videos must have the same number of frames unless `matched_frames` is provided')
-    
-    if matched_frames is not None:
-        assert matched_frames.max(0) < np.array(num_frames), fill(
-              '`matched_frames` contains indices that are out of range. '
-            + f'The DeepLabCut metadata reports the following frame counts: {num_frames}, '
-            + f'but the maximum indeces in `matched_frames` are {matched_frames.max(0)}')
-          
-    if matched_frames is None:
-        matched_frames = np.repeat(np.arange(num_frames[0])[:,None],len(num_frames),axis=1)
-    
+    if verbose: print(f'Loading {filepath}')
+    results = pickle.load(open(filepath, 'rb'))
+    metadata = results['metadata']
+
     # get dimensions
-    C = len(filepaths)            # number of cameras
-    T = matched_frames.shape[0]   # number of frames
+    T = metadata['nframes']
     K = len(bodyparts)            # number of keypoints
     N = len(recorded_individuals) # number of individuals 
 
-    coordinates = np.zeros((N,T,K,C,2))*np.nan
-    confidences = np.zeros((N,T,K,C))
-    affinities = np.zeros((N,N,T,K,C))
-    identities = np.zeros((N,N,T,K,C))
+    coordinates = np.zeros((N,T,K,2))*np.nan
+    confidences = np.zeros((N,T,K))
+    affinities = np.zeros((N,N,T,K))
+    identities = np.zeros((N,N,T,K))
+
+    # make sure bodypart names match
+    assert tuple(metadata['all_joints_names'])==tuple(bodyparts), fill(
+        f'`bodyparts` does not match `all_joints_names` in the metadata of {filepath}')
     
-    if verbose: print('Formatting data')
-    for c, (results, filepath) in enumerate(zip(all_results, filepaths)):
-        metadata = results['metadata']
+    # make sure PAF graph contains required edges
+    paf_graph = set(map(tuple,np.sort(np.argsort(node_order)[np.array(metadata['PAFgraph'])],axis=1)))
+    required_pafs = set(map(tuple,np.array([parents,np.arange(len(parents))]).T[1:]))
+    missing_pafs = [[bodyparts[node_order[i]] for i in paf] for paf in required_pafs - paf_graph]
+    assert required_pafs.issubset(paf_graph), fill(
+        f'PAF graph in {filepath} does not match `parents`. The following edges are missing: {missing_pafs}')
 
-        # make sure bodypart names match
-        assert tuple(metadata['all_joints_names'])==tuple(bodyparts), fill(
-            f'`bodyparts` does not match `all_joints_names` in the metadata of {filepath}')
-        
-        # make sure PAF graph contains required edges
-        paf_graph = set(map(tuple,np.sort(np.argsort(node_order)[np.array(metadata['PAFgraph'])],axis=1)))
-        required_pafs = set(map(tuple,np.array([parents,np.arange(len(parents))]).T[1:]))
-        missing_pafs = [[bodyparts[node_order[i]] for i in paf] for paf in required_pafs - paf_graph]
-        assert required_pafs.issubset(paf_graph), fill(
-            f'PAF graph in {filepath} does not match `parents`. The following edges are missing: {missing_pafs}')
+    # format data
+    for frame,detections in tqdm.tqdm(results.items(), disable=(not verbose)):
+        if frame.startswith('frame'):
+            frame_ix = int(frame[5:])
+    
+            idxs = []
+            for k in range(K):
+                if len(detections['confidence'][k][:,0]) > 0:
+                    idx = np.argsort(detections['confidence'][k][:,0])[::-1][:N]
+                    confidences[:len(idx),frame_ix,k] = detections['confidence'][k][idx,0]
+                    identities[:len(idx),:,frame_ix,k] = detections['identity'][k][idx,:][:,id_channels]
+                    coordinates[:len(idx),frame_ix,k] = detections['coordinates'][0][k][idx]
+                    idxs.append(idx)
+                else: idxs.append([])
 
-        # format data
-        for frame,detections in tqdm.tqdm(results.items(), disable=(not verbose)):
-            if frame.startswith('frame'):
-                frame_ix = int(frame[5:])
-        
-                idxs = []
-                for k in range(K):
-                    if len(detections['confidence'][k][:,0]) > 0:
-                        idx = np.argsort(detections['confidence'][k][:,0])[::-1][:N]
-                        confidences[:len(idx),frame_ix,k,c] = detections['confidence'][k][idx,0]
-                        identities[:len(idx),:,frame_ix,k,c] = detections['identity'][k][idx,:][:,id_channels]
-                        coordinates[:len(idx),frame_ix,k,c] = detections['coordinates'][0][k][idx]
-                        idxs.append(idx)
-                    else: idxs.append([])
-
-                o = np.argsort(node_order)
-                for ind,(k1,k2) in zip(metadata['PAFinds'],metadata['PAFgraph']):
-                    if len(idxs[k1])==0 or len(idxs[k2])==0: continue
-                    m1 = detections['costs'][ind]['m1']
-                    if o[k1] < o[k2]: m1,k1,k2 = m1.T,k2,k1
-                    affinities[:len(idxs[k1]),:len(idxs[k2]),frame_ix,k1,c] = m1[idxs[k1],:][:,idxs[k2]]
+            o = np.argsort(node_order)
+            for ind,(k1,k2) in zip(metadata['PAFinds'],metadata['PAFgraph']):
+                if len(idxs[k1])==0 or len(idxs[k2])==0: continue
+                m1 = detections['costs'][ind]['m1']
+                if o[k1] < o[k2]: m1,k1,k2 = m1.T,k2,k1
+                affinities[:len(idxs[k1]),:len(idxs[k2]),frame_ix,k1] = m1[idxs[k1],:][:,idxs[k2]]
 
     return (coordinates[:,:,node_order],
             confidences[:,:,node_order],
             affinities[:,:,:,node_order],
             identities[:,:,:,node_order])
+
+
+
+def sample_deeplabcut_assemblies(filepath_pattern, node_order, min_confidence=0.5, 
+                                 sample_size=100, recursive=True):
+    """
+    Sample poses from a collection of DeepLabCut *assemblies.pickle files.
+    
+    Parameters
+    ----------
+    filepath_pattern : str
+        A pattern for finding the assemblies.pickle files. Can be the name of 
+        a directory or a glob pattern (e.g. 'path/to/assemblies/prefix*').
+        Assemblies will be sampled from all files that match the pattern
+        and end in 'assemblies.pickle'.
+
+    node_order : list of int
+        Node order to be used during modeling. For example, if 
+        `node_order[0]=5` then after reordering the first node
+        will be `bodyparts[5]`.
+
+    min_confidence : float, default=0.5
+        Minimum confidence score for a pose to be included in the sample.
+
+    sample_size : int, default=100
+        Number of poses to sample from each file.
+
+    recursive : bool, default=True
+        If True, search for assemblies in subdirectories as well.
+    """
+    assembly_files = list_files_with_suffixes(
+        filepath_pattern, ['assemblies.pickle'], recursive=recursive)
+    
+    sampled_assemblies = []
+    for filepath in tqdm.tqdm(assembly_files, desc='Sampling assemblies'):
+        try:
+            assemblies = pickle.load(open(filepath,'rb'))
+            keys = sorted(assemblies.keys())
+            num_sampled = 0
+            for i in np.random.permutation(len(keys)):
+                if isinstance(keys[i],int):
+                    for assembly in assemblies[keys[i]]:
+                        if assembly[:,2].min() > min_confidence:
+                            sampled_assemblies.append(assembly[node_order,:2])
+                            num_sampled += 1
+                if num_sampled >= sample_size: 
+                    break
+        except Exception as e: 
+            print(fill(f'Error loading {filepath}: {e}'))
+
+    return np.array(sampled_assemblies)
+        
 
 
 def format_sleap_paf_graph(node_order, parents, n_individuals,
@@ -760,7 +840,7 @@ def sleap_infer_paf_graphs(video_path, model_path, node_order,
     # load the sleap model
     predictor = load_model(model_path)
     predictor.inference_model.bottomup_layer.return_paf_graph = True
-    
+
     if batch_size is not None:
         predictor.batch_size = batch_size
     if peak_threshold is not None:
@@ -777,6 +857,8 @@ def sleap_infer_paf_graphs(video_path, model_path, node_order,
         tracking_results.append(format_sleap_paf_graph(
             node_order, parents, n_individuals, **paf_graph))
         
-    coordinates, confidences, affinities = map(np.array, zip(*tracking_results))
+    coordinates = np.concatenate([t[0] for t in tracking_results], axis=1)
+    confidences = np.concatenate([t[1] for t in tracking_results], axis=1)
+    affinities = np.concatenate([t[2] for t in tracking_results], axis=2)
     return coordinates, confidences, affinities
 
