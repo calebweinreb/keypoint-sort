@@ -1,16 +1,18 @@
 import os
-import glob
 import yaml
 import tqdm
 import h5py
 import pickle
 import numpy as np
+import multiprocessing
 
 import warnings
 from textwrap import fill
 warnings.formatwarning = lambda msg, *a: str(msg)
 
 from .util import build_node_hierarchy
+
+from gimbal.util_io import load_camera_parameters
 
 
 def _build_yaml(sections, comments):
@@ -42,18 +44,13 @@ def generate_config(project_dir, **kwargs):
     def _update_dict(new, original):
         return {k:new[k] if k in new else v for k,v in original.items()} 
     
+
     gimbal = _update_dict(kwargs, {
-        'max_distance_std': 3,
-        'min_confidence': 0.5,
         'num_sample_poses': 500,
         'num_sample_session': 10,
         'num_iters': 500,
         'num_states': 50,
         'num_animals': 2,
-        'identity_pseudocount': .3,
-        'outlier_pseudocount': 1e-5,
-        'affinity_center': 0.2,
-        'affinity_gain': 20,
         'obs_outlier_variance': 1e6,
         'obs_inlier_variance': 10,
         'pos_dt_variance': 5,
@@ -67,6 +64,7 @@ def generate_config(project_dir, **kwargs):
         'root_edge': ['BODYPART1','BODYPART2']})
         
     other = _update_dict(kwargs, {
+        'dataset_info': {},
         'individuals': None,
         'video_dir': '',
         'keypoint_colormap': 'autumn',
@@ -284,187 +282,96 @@ def setup_project(project_dir, overwrite=False, deeplabcut_config=None, **option
     generate_config(project_dir, **options)
      
 
-def list_files(filepath_pattern, recursive):
+def load_calibration(path):
     """
-    This function lists all the files matching a pattern.
+    Load a camera calibration file.
+
+    The file should be in hdf5 format and contain a group called
+    `camera_parameters` and include the following datasets:
+
+        - `camera_names`: list of camera names
+        - `rotation`: rotation matrices (n_cameras, 3, 3)
+        - `translation`: translation vectors (n_cameras, 3)
+        - `intrinsic`: intrinsic camera matrices (n_cameras, 3, 3)
+        - `dist_coefs`: distortion coefficients (n_cameras, 5)
 
     Parameters
     ----------
-    filepath_pattern : str or list
-        A filepath pattern or a list thereof. Filepath patterns can be
-        be a single file, a directory, or a path with wildcards (e.g.,
-        '/path/to/dir/prefix*').
-
-    recursive : bool, default=True
-        Whether to search for files recursively.
+    path: str
+        Path to the calibration file
 
     Returns
     -------
-    list
-        A list of file paths.
-    """   
-    if isinstance(filepath_pattern, list):
-        matches = []
-        for fp in filepath_pattern:
-            matches += list_files(fp, recursive)
-        return sorted(set(matches))
+    camera_names: list
+        Ordered list of camera names
     
-    else:
-        matches = glob.glob(filepath_pattern)
-        if recursive:
-            for match in list(matches):
-                matches += glob.glob(os.path.join(match, '**'), recursive=True)
-        return matches
-    
+    projection_matrices: array, shape (n_cameras, 3, 4)
+        Projection matrices (intrinsic @ [R | t]) for each camera
 
-def list_files_with_exts(filepath_pattern, ext_list, recursive=True):
+    rotation: array, shape (n_cameras, 3, 3)
+        Rotation matrices from the world coordinate system to each
+         camera's coordinate system.
+
+    translation: array, shape (n_cameras, 3)
+        Translation vectors from the world coordinate system to each
+        camera's coordinate system.
+
+    intrinsic: array, shape (n_cameras, 3, 3)
+        Intrinsic camera matrices
+
+    dist_coefs: array, shape (n_cameras, 5)
+        Distortion coefficients for in OpenCV format (k1, k2, p1, p2, k3)
     """
-    This function lists all the files matching a pattern and with a
-    an extension/suffix in a list of extensions.
+    with h5py.File(path, 'r') as f:
+        rotation = f['camera_parameters']['rotation'][()]
+        translation = f['camera_parameters']['translation'][()]
+        intrinsic = f['camera_parameters']['intrinsic'][()]
+        dist_coefs = f['camera_parameters']['dist_coefs'][()]
+        camera_names = f['camera_parameters']['camera_names'][()]
+        camera_names = [name.decode('utf-8') for name in camera_names]
+
+    extrinsics = np.concatenate((rotation, translation[:,:,np.newaxis]), axis=2)
+    projection_matrices = np.matmul(intrinsic, extrinsics)
+    return camera_names, projection_matrices, rotation, translation, intrinsic, dist_coefs
+
+
+def load_matched_frames(path):
+    """
+    Load a table of matched frames for a set of videos.
+
+    For multi-camera recordings that have distinct start/end times
+    or dropped frames, this table can be used for synchronization.
+    The header should be a list of camera names and each row should
+    contain a set of frame indexes that are temporally aligned across
+    each video. For example, the table below indicates that frame 0
+    of camera1 corresponds to frame 1 of camera2::
+
+        camera1,camera2
+        0,1
+        ...
 
     Parameters
     ----------
-    filepath_pattern : str or list
-        A filepath pattern or a list thereof. Filepath patterns can be
-        be a single file, a directory, or a path with wildcards (e.g.,
-        '/path/to/dir/prefix*').
-
-    ext_list : list of str
-        A list of file extensions to search for.
-
-    recursive : bool, default=True
-        Whether to search for files recursively.
+    path: str
+        Path to the matched frames table
 
     Returns
     -------
-    list
-        A list of file paths.
+    matched_frames: dict
+        Dictionary mapping camera names to arrays of frame indexes
     """
-    ext_list = ['.'+ext.strip('.').lower() for ext in ext_list]
-    has_ext = lambda f: os.path.splitext(f)[1].lower() in ext_list
-    matches = list(filter(has_ext, list_files(filepath_pattern, recursive)))
-    return matches
-    
-
-def list_files_with_suffixes(filepath_pattern, suffix_list, recursive=True):
-    """
-    This function lists all the files matching a pattern and with a
-    a suffix in the specified list.
-
-    Parameters
-    ----------
-    filepath_pattern : str or list
-        A filepath pattern or a list thereof. Filepath patterns can be
-        be a single file, a directory, or a path with wildcards (e.g.,
-        '/path/to/dir/prefix*').
-
-    suffix_list : list of str
-        A list of acceptable suffixes.
-
-    recursive : bool, default=True
-        Whether to search for files recursively.
-
-    Returns
-    -------
-    list
-        A list of file paths.
-    """
-    has_suffix = lambda s: any([s.endswith(suff) for suff in suffix_list])
-    matches = list(filter(has_suffix, list_files(filepath_pattern, recursive)))
-    return matches
-
-
-def _name_from_path(filepath, path_in_name, path_sep):
-    """
-    Create a name from a filepath. Either return the name of the file
-    (with the extension removed) or return the full filepath, where the
-    path separators are replaced with `path_sep`.
-    """
-    filepath = os.path.splitext(filepath)[0]
-    if path_in_name:
-        return filepath.replace(os.path.sep, path_sep)
-    else:
-        return os.path.basename(filepath)
-    
-
-def find_matching_videos(keys, video_dir, as_dict=False, recursive=True, 
-                         session_name_suffix='', video_extension=None):
-    """
-    Find video files for a set of session names. The filename of each
-    video is assumed to be a prefix within the session name, i.e. the
-    session name has the form `{video_name}{more_text}`. If more than 
-    one video matches a session name, the longest match will be used. 
-    For example given the following video directory::
-
-        video_dir
-        ├─ videoname1.avi
-        └─ videoname2.avi
- 
-    the videos would be matched to session names as follows::
-
-        >>> keys = ['videoname1blahblah','videoname2yadayada']
-        >>> find_matching_videos(keys, video_dir, as_dict=True)
-
-        {'videoname1blahblah': 'video_dir/videoname1.avi',
-         'videoname2blahblah': 'video_dir/videoname2.avi'}
-
-    A suffix can also be specified, in which case the session name 
-    is assumed to have the form `{video_name}{suffix}{more_text}`.
- 
-    Parameters
-    -------
-    keys: iterable
-        Session names (as strings)
-
-    video_dir: str
-        Path to the video directory. 
-        
-    video_extension: str, default=None
-        Extension of the video files. If None, videos are assumed to 
-        have the one of the following extensions: "mp4", "avi", "mov"
-
-    recursive: bool, default=True
-        If True, search recursively for videos in subdirectories of
-        `video_dir`.
-
-    as_dict: bool, default=False
-        Determines whether to return a dict mapping session names to 
-        video paths, or a list of paths in the same order as `keys`.
-
-    session_name_suffix: str, default=None
-        Suffix to append to the video name when searching for a match.
-
-    Returns
-    -------
-    video_paths: list or dict (depending on `as_dict`)
-    """  
-
-    if video_extension is None:
-        extensions = ['.mp4','.avi','.mov']
-    else: 
-        if video_extension[0] != '.': 
-            video_extension = '.'+video_extension
-        extensions = [video_extension]
-
-    videos = list_files_with_exts(video_dir, extensions, recursive=recursive)
-    videos_to_paths = {os.path.splitext(os.path.basename(f))[0]:f for f in videos}
-
-    video_paths = []
-    for key in keys:
-        matches = [v for v in videos_to_paths if \
-                   os.path.basename(key).startswith(v+session_name_suffix)]
-        assert len(matches)>0, fill(f'No matching videos found for {key}')
-        
-        longest_match = sorted(matches, key=lambda v: len(v))[-1]
-        video_paths.append(videos_to_paths[longest_match])
-
-    if as_dict: return dict(zip(sorted(keys),video_paths))
-    else: return video_paths
+    camera_names = open(path, 'r').readline().strip('\n').split(',')
+    frame_indexes = np.loadtxt(path, delimiter=',', skiprows=1, dtype=int)
+    matched_frames = {name: ixs for name, ixs in zip(camera_names, frame_indexes.T)}
+    return matched_frames
 
 
 def save_detections_to_h5(filepath, coordinates, confidences, affinities, identities):
     """
     Save keypoint detections to an HDF5 file.
+
+    The file will contain the the keys `coordinates`, `confidences`,
+    `affinities`, and `identities` which are described below.
 
     Parameters
     ----------
@@ -493,6 +400,10 @@ def save_detections_to_h5(filepath, coordinates, confidences, affinities, identi
 def load_detections_from_h5(filepath):
     """
     Load keypoint detections from an HDF5 file.
+
+    The file should contain the the keys `coordinates`, `confidences`,
+    `affinities`, and `identities` that point to arrays with the format
+    described below.
 
     Parameters
     ----------
@@ -524,9 +435,90 @@ def load_detections_from_h5(filepath):
     return coordinates, confidences, affinities, identities
 
 
+def load_multicamera_detections(keypoint_detections, calibration_path, 
+                                matched_frames_path=None, **kwargs):
+    """
+    Load and merge keypoints detections from multiple cameras.
+
+    The detections for each camera are stacked in the order defined
+    by the calibration file. If `matched_frames_path` is provided, 
+    the detections will be synchronized using the matched frames table.
+
+    Parameters
+    ----------
+    keypoint_detections : dict
+        Dictionary mapping camera names to h5 files with keypoint detections.
+        If no extension is provided, the extension ".h5" is assumed.
+        The files should have the format expected by
+        :py:func:`keypoint_sort.io.load_detections_from_h5`.
+
+    calibration_path : str
+        Path to the camera calibration file.
+
+    matched_frames_path : str, default=None
+        Path to the matched frames file. If None, frames from each video
+        are assumed to be already synchronized. See 
+        :py:func:`keypoint_sort.io.load_matched_frames` for more details
+        about the format of the matched frames file.
+
+    Returns
+    -------
+    coordinates : ndarray of shape (n_individuals, n_frames, n_bodyparts, n_cameras, 2)
+        Coordinates of multi-animal keypoints detections for each camera.
+
+    confidences : ndarray of shape (n_individuals, n_frames, n_bodyparts, n_cameras)
+        Confidences of multi-animal keypoints detections for each camera.
+
+    affinities : ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts, n_cameras)
+        Part affinity field weights for each edge in the node hierarchy,
+        where `affinities[i,j,t,k,c]` is the weight from keypoint `[i,t,k]`
+        to keypoint `[j,t,parent(k)]` in camera `c`.
+
+    identities : ndarray of shape (n_individuals, n_individuals, n_frames, n_bodyparts, n_cameras)
+        Identity weights for each keypoint, where `identities[i,j,t,k,c]`
+        is the weight that keypoint `[i,t,k]` belongs to individual `j` in camera `c`.
+    """
+    # Load calibration
+    camera_names = load_calibration(calibration_path)[0]
+
+    # Load detections
+    detections = {}
+    for camera_name,filepath in keypoint_detections.items():
+        if not (filepath.endswith('.h5') or filepath.endswith('.hdf5')):
+            filepath += '.h5'
+        detections[camera_name] = load_detections_from_h5(filepath)
+
+    # Load matched frames
+    if matched_frames_path is not None:
+        matched_frames = load_matched_frames(matched_frames_path)
+    else:
+        num_frames = {camera_name:d[0].shape[1] for camera_name,d in detections.items()}
+        assert len(set(num_frames.values())) == 1, \
+            'All detections must have the same number of frames if `matched_frames_path` is not provided.'
+        matched_frames = {camera_name:np.arange(num_frames[camera_name]) for camera_name in camera_names}
+
+    # Merge detections
+    coordinates, confidences, affinities, identities = [], [], [], []
+
+    for camera_name in camera_names:
+        ixs = matched_frames[camera_name]
+        coordinates.append(detections[camera_name][0][:, ixs])
+        confidences.append(detections[camera_name][1][:, ixs])
+        affinities.append(detections[camera_name][2][:, :, ixs])
+        identities.append(detections[camera_name][3][:, :, ixs])
+    
+    coordinates = np.stack(coordinates, axis=-2)
+    confidences = np.stack(confidences, axis=-1)
+    affinities = np.stack(affinities, axis=-1)
+    identities = np.stack(identities, axis=-1)
+
+    return coordinates, confidences, affinities, identities
+
+
+
 def load_deeplabcut_full(filepath, bodyparts, node_order, parents, 
                          individuals=None, recorded_individuals=None, 
-                         matched_frames=None, verbose=True, **kwargs):
+                         verbose=True, **kwargs):
     """
     Load multi-animal DeepLabCut results from a "_full.p" file.
 
@@ -538,7 +530,7 @@ def load_deeplabcut_full(filepath, bodyparts, node_order, parents,
 
     Parameters
     ----------
-    filepath : str or list of str
+    filepath : str
         Path to the DeepLabCut results. 
 
     bodyparts : list of str
@@ -558,7 +550,7 @@ def load_deeplabcut_full(filepath, bodyparts, node_order, parents,
         Ordered of list of individuals used for training DeepLabCut.
 
     recorded_individuals : list of str, default=None
-        Subset of individuals in the current recorded. Will only be
+        Subset of individuals in the current recording. Will only be
         used if `individuals` is specified as well.
     
     verbose : bool, default=True
@@ -642,56 +634,63 @@ def load_deeplabcut_full(filepath, bodyparts, node_order, parents,
             identities[:,:,:,node_order])
 
 
-
-def sample_deeplabcut_assemblies(filepath_pattern, node_order, min_confidence=0.5, 
-                                 sample_size=100, recursive=True):
+def format_deeplabcut_results(dataset_info, bodyparts, node_order, parents, 
+                              individuals=None, parallelize=True, overwrite=False,
+                              **kwargs):
     """
-    Sample poses from a collection of DeepLabCut *assemblies.pickle files.
-    
+    Reformat DeepLabCut full.pickle files using `load_deeplabcut_full`.
+
+    For each results path in `dataset_info`, the file
+    `[path]_full.pickle` will be loaded and reformatted using
+    `load_deeplabcut_full`. The results will be saved to a new file
+    called `[path].h5` in the same directory.
+
+    See `load_deeplabcut_full` for more details, including the
+    parameters `bodyparts`, `node_order`, `parents`, and `individuals`.
+
     Parameters
     ----------
-    filepath_pattern : str
-        A pattern for finding the assemblies.pickle files. Can be the name of 
-        a directory or a glob pattern (e.g. 'path/to/assemblies/prefix*').
-        Assemblies will be sampled from all files that match the pattern
-        and end in 'assemblies.pickle'.
+    dataset_info : dict
+        Nested dictionary with the following structure::
 
-    node_order : list of int
-        Node order to be used during modeling. For example, if 
-        `node_order[0]=5` then after reordering the first node
-        will be `bodyparts[5]`.
+            {
+                'name_of_recording': {  
+                    'keypoint_detections': { 
+                        'name_of_camera': 'path/to/dlc_results',
+                        'name_of_camera': 'path/to/dlc_results',
+                        ...
+                    },
+                    'recorded_individuals': ['name_of_individual', ...]
+                },
+                ...
+            }
 
-    min_confidence : float, default=0.5
-        Minimum confidence score for a pose to be included in the sample.
+    parallelize : bool, default: True
+        If True, the reformatting will be parallelized across recordings.
 
-    sample_size : int, default=100
-        Number of poses to sample from each file.
-
-    recursive : bool, default=True
-        If True, search for assemblies in subdirectories as well.
+    overwrite : bool, default: False
+        If True, already extracted files will be overwritten. Otherwise
+        they will be skipped.
     """
-    assembly_files = list_files_with_suffixes(
-        filepath_pattern, ['assemblies.pickle'], recursive=recursive)
-    
-    sampled_assemblies = []
-    for filepath in tqdm.tqdm(assembly_files, desc='Sampling assemblies'):
-        try:
-            assemblies = pickle.load(open(filepath,'rb'))
-            keys = sorted(assemblies.keys())
-            num_sampled = 0
-            for i in np.random.permutation(len(keys)):
-                if isinstance(keys[i],int):
-                    for assembly in assemblies[keys[i]]:
-                        if assembly[:,2].min() > min_confidence:
-                            sampled_assemblies.append(assembly[node_order,:2])
-                            num_sampled += 1
-                if num_sampled >= sample_size: 
-                    break
-        except Exception as e: 
-            print(fill(f'Error loading {filepath}: {e}'))
-
-    return np.array(sampled_assemblies)
+    def reformat(path, recorded_individuals):
+        detections = load_deeplabcut_full(
+            f'{path}_full.pickle', bodyparts, node_order, parents, 
+            individuals, recorded_individuals, verbose=(not parallelize))
+        save_detections_to_h5(f'{path}.h5', *detections)
         
+    run_queue = []
+    for recording_info in dataset_info.values():
+        for path in recording_info['keypoint_detections'].values():
+            if os.path.exists(f'{path}.h5') and not overwrite: continue
+            run_queue.append((path, recording_info['recorded_individuals']))
+
+    if parallelize:
+        with multiprocessing.Pool() as pool:
+            pool.starmap(reformat, run_queue)
+    else:
+        for path, recorded_individuals in run_queue:
+            reformat(path, recorded_individuals)
+
 
 
 def format_sleap_paf_graph(node_order, parents, n_individuals,

@@ -2,12 +2,14 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from functools import partial
-from itertools import permutations
 import gimbal
 na = jnp.newaxis
 
-from .util import log_normalize, gaussian_log_prob
-
+from .util import (
+    log_normalize, interpolate_keypoints, 
+    all_permutations, permutation_product_indexes
+)
+import tensorflow_probability.substrates.jax.distributions as tfd
 
 #-----------------------------------------------------------------------------#
 #                              Keypoint sorting model                         #
@@ -19,7 +21,7 @@ def viterbi_assignments(
     clique_affinity_col_norm):
     """
     Compute max likelihood assignments for each keypoint observation
-    given affinity scores and independent keypoint/assignment log-likelihoods.
+    given affinity scores and per-keypoint assignment probabilities.
     """
     # get subtree potentials by message passing up the tree
     N,T,K,C = assign_lls.shape[1:]
@@ -37,10 +39,11 @@ def viterbi_assignments(
     pass_forward = partial(
         tree_max_likelihood_forward, parents,
         subtree_marg, clique_affinity_row_norm)
-    samples = jax.lax.scan(pass_forward, jnp.zeros((T,K,C), dtype=int), jnp.arange(K,0,-1))[0]
-    return jnp.transpose(permutations[samples], axes=(3,0,1,2))
-
-
+    assignments = jax.lax.scan(pass_forward, jnp.zeros((T,K,C), dtype=int), jnp.arange(K))[0]
+    return jnp.transpose(permutations[assignments], axes=(3,0,1,2))
+    
+ 
+'''
 @jax.jit
 def initial_assignments(
     observations, identity, 
@@ -50,7 +53,7 @@ def initial_assignments(
     """
     To initialize assignments, first get maximum likelihood assignments
     for each frame separately using just affinities and identity probabilities,
-    then use the continuity of keypoint locations to optionally permute
+    then use the continuity of keypoint locations to optimally permute
     the labels in each frame (eta = gaussian kernel variance for continuity).
     """
     N, T, K, C = observations.shape[:-1]
@@ -69,8 +72,7 @@ def initial_assignments(
     # random walk model with variance eta for keypoint motion across frames
     obs_split = split_animals(observations, assignments_init)
     permutation_transition_ll = -(jnp.nan_to_num(obs_split[permutations,1:] - obs_split[na,:,:-1])**2).sum((1,3,5)) / eta
-    perm2perm = jnp.argmax((permutations[:,permutations][:,:,na,:]==permutations[na,na:,:]).sum(-1),-1) 
-    transition_lls = permutation_transition_ll[perm2perm,:,:]
+    transition_lls = permutation_transition_ll[permutation_product_indexes(N),:,:]
     tmats = jnp.exp(transition_lls - transition_lls.max(1, keepdims=True))+1e-6
     log_tmats = jnp.log(jnp.transpose(tmats / tmats.sum(1, keepdims=True), axes=(3,2,0,1)))
 
@@ -82,7 +84,7 @@ def initial_assignments(
     # apply permutations to `assignments_init`
     assignments_init = jnp.take_along_axis(assignments_init, permutations[seqs].T.reshape(N,T,1,C), axis=0)
     return assignments_init
-
+'''
 
 
 def viterbi_simple(L, P0):
@@ -102,14 +104,79 @@ def viterbi_simple(L, P0):
     return jnp.append(seq, end_state)
 
 
-def all_permutations(N):
-    return jnp.array(list(permutations(range(N))))
-
 def tree_pass_backward(parents, clique_affinity_col_norm, subtree_marg, k):
+    """
+    Perform message passing up the pose tree to get subtree marginals.
+    
+    Subtree marginals represent the log probabilities of each identity 
+    assignment permutation at node k, marginalizing over the subtree
+    rooted at k.
+
+    Parameters
+    ----------
+    parents : jnp.ndarray, shape (K,)
+        Array of parent indices for each keypoint where parents[i] = j
+        means that keypoint i is a child of keypoint j.
+
+    clique_affinity_col_norm : jnp.ndarray, shape (N!,N!,T,K,C)
+        See `clique_affinity_col_norm` in :py:class:`KeypointSort`.
+
+    subtree_marg : jnp.ndarray, shape (N!,T,K,C)
+        Partially filled-in array of subtree marginals. This function 
+        assumes that subtree_marg[:,:,k,:] is filled in and uses it to
+        increment subtree_marg[:,:,parents[k],:].
+
+    k : int
+        Keypoint index. This function assumes that subtree_marg[:,:,k,:]
+        is filled in and uses it to increment subtree_marg[:,:,parents[k],:].
+
+    Returns
+    -------
+    subtree_marg : jnp.ndarray, shape (N!,T,K,C)
+        Partially filled-in array of subtree marginals.
+    """
     msg = jax.nn.logsumexp(clique_affinity_col_norm[:,:,:,k,:]+subtree_marg[:,na,:,k,:],axis=0)
     return subtree_marg.at[:,:,parents[k],:].add(msg), None
 
+
 def tree_samp_forward(parents, subtree_marg, clique_affinity_row_norm, carry, k):
+    """
+    Perform message passing down the pose tree to sample identity assignments.
+
+    Parameters
+    ----------
+    parents : jnp.ndarray, shape (K,)
+        Array of parent indices for each keypoint where parents[i] = j
+        means that keypoint i is a child of keypoint j.
+
+    subtree_marg : jnp.ndarray, shape (N!,T,K,C)
+        Subtree marginals, which represent the log probabilities of each 
+        identity assignment permutation at node k, marginalizing over the 
+        subtree rooted at k.
+
+    clique_affinity_row_norm : jnp.ndarray, shape (N!,N!,T,K,C)
+        See `clique_affinity_row_norm` in :py:class:`KeypointSort`.
+
+    carry : tuple
+        Tuple of (key, samples) where key is a jax.random.PRNGKey and
+        samples is a jnp.ndarray of shape (N,T,K,C) representing the
+        current identity assignments.
+
+    k : int
+        Keypoint index. This function assumes that the identity assignments
+        for parents[k] are filled in and uses them to sample the identity
+        assignment for keypoint k.
+
+    Returns
+    -------
+    carry : tuple
+        Tuple of (key, samples) where key is a jax.random.PRNGKey and
+        samples is a jnp.ndarray of shape (N,T,K,C) representing the
+        current (partially-completed) identity assignments.
+
+    out : None
+        Dummy output for jax.lax.scan.
+    """
     key, samples = carry
     key, newkey = jr.split(key)
     cond_k = jnp.take_along_axis(clique_affinity_row_norm[:,:,:,k], samples[:,parents[k]][na,na], axis=1)[:,0]
@@ -117,9 +184,61 @@ def tree_samp_forward(parents, subtree_marg, clique_affinity_row_norm, carry, k)
     sample = jr.categorical(newkey, marg_k, axis=0)
     return (key, samples.at[:,k].set(sample)), None
 
+
+def tree_max_likelihood_forward(parents, subtree_marg, clique_affinity_row_norm, assignments, k): 
+    """
+    Perform message passing down the pose tree to calculate the max likelihood
+    identity assignments.
+
+    Parameters
+    ----------
+    parents : jnp.ndarray, shape (K,)
+        Array of parent indices for each keypoint where parents[i] = j
+        means that keypoint i is a child of keypoint j.
+
+    subtree_marg : jnp.ndarray, shape (N!,T,K,C)
+        Subtree marginals, which represent the log probabilities of each 
+        identity assignment permutation at node k, marginalizing over the 
+        subtree rooted at k.
+
+    clique_affinity_row_norm : jnp.ndarray, shape (N!,N!,T,K,C)
+        See `clique_affinity_row_norm` in :py:class:`KeypointSort`.
+
+    assignments : jnp.ndarray, shape (N,T,K,C)
+        Current identity assignments.
+
+    k : int
+        Keypoint index. This function assumes that the identity assignments
+        for parents[k] are filled in and uses them to assign the identities
+        for keypoint k.
+
+    Returns
+    -------
+    assignments : jnp.ndarray, shape (N,T,K,C)
+        Updated identity assignments.
+    """
+    cond_k = clique_affinity_row_norm[:,assignments[:,parents[k],:],
+                                       jnp.arange(assignments.shape[0])[:,na],k,
+                                       jnp.arange(assignments.shape[2])[na,:]]
+    assignment = jnp.argmax(subtree_marg[:,:,k,:] + cond_k, axis=0)
+    return assignments.at[:,k,:].set(assignment), None
+
+
+
 def split_animals(X, assignments):
-    """Use assignments to sort an array X of shape (B,N,T,K,C,...) such 
-    that all keypoints for animal i are in slice [:,i,:,:,:,...]
+    """
+    Use assignments to sort an array X of shape (N,T,K,C,[dim]) such 
+    that all keypoints for animal i are in slice [i,:,:,:,[dim]]
+
+    Parameters
+    ----------
+    X : jnp.ndarray, shape (N,T,K,C,[dim])
+        Array to be sorted by assignments.
+        
+    assignments : jnp.ndarray, shape (N,T,K,C)
+        Identity assignments where assignments[i,t,k,c] = j means that 
+        the i'th instance of keypoint k in frame t and camera c belongs 
+        to animal j.
     """
     extra_axes = len(X.shape)-len(assignments.shape)
     assignments = assignments.reshape(*assignments.shape, *[1]*extra_axes)
@@ -132,7 +251,33 @@ def forward_backward_assignments(
     clique_affinity_col_norm):
     """
     Sample posterior assignments for each keypoint observation
-    given affinity scores and independent keypoint/assignment log-likelihoods.
+    given affinity scores and per-keypoint assignment probabilities.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        Random number generator key.
+
+    parents : jnp.ndarray, shape (N,)
+        Array of parent indices for each keypoint where parents[i] = j
+        means that keypoint i is a child of keypoint j.
+
+    assign_lls : jnp.ndarray, shape (N,N,T,K,C)
+        Per-keypoint assignment log-likelihoods where 
+        assign_lls[i,j,t,k,c] = log P(keypoint i is assigned to animal j)
+
+    clique_affinity_row_norm : jnp.ndarray, shape (N!,N!,T,K,C)
+        See `clique_affinity_row_norm` in :py:class:`KeypointSort`.
+
+    clique_affinity_col_norm : jnp.ndarray, shape (N!,N!,T,K,C)
+        See `clique_affinity_col_norm` in :py:class:`KeypointSort`.
+
+    Returns
+    -------
+    assignments : jnp.ndarray, shape (N,T,K,C)
+        Sampled identity assignments where assignments[i,t,k,c] = j 
+        means that i'th instance of keypoint k in frame t and camera 
+        c belongs to animal j.
     """
     # get subtree potentials by message passing up the tree
     N,T,K,C = assign_lls.shape[1:]
@@ -150,7 +295,7 @@ def forward_backward_assignments(
     pass_forward = partial(
         tree_samp_forward, parents, 
         subtree_marg, clique_affinity_row_norm)
-    samples = jax.lax.scan(pass_forward, (key, jnp.zeros((T,K,C),dtype=int)), jnp.arange(K,0,-1))[0][1]
+    samples = jax.lax.scan(pass_forward, (key, jnp.zeros((T,K,C),dtype=int)), jnp.arange(K))[0][1]
     
     log_likelihood = (
           jnp.nan_to_num(log_norm).sum()
@@ -162,15 +307,6 @@ def forward_backward_assignments(
             samples[na,na,:,parents], axis=1)).sum())
     
     return jnp.transpose(permutations[samples], axes=(3,0,1,2)), log_likelihood
-
-
-def tree_max_likelihood_forward(parents, subtree_marg, clique_affinity_row_norm, samples, k): 
-    cond_k = clique_affinity_row_norm[:,samples[:,parents[k],:],
-                                       jnp.arange(samples.shape[0])[:,na],k,
-                                       jnp.arange(samples.shape[2])[na,:]]
-    sample = jnp.argmax(subtree_marg[:,:,k,:] + cond_k, axis=0)
-    return samples.at[:,k,:].set(sample), None
-
 
 
 class KeypointSort:
@@ -236,6 +372,19 @@ class KeypointSort:
     
     permutations : ndarray, shape (N!,N)
         All permutations of size N
+
+    clique_affinity : ndarray, shape (N!,N!,T,K,C)
+        Conditional log probabilities for all possible combinations of
+        identity permutations across each parent-child pair, i.e.,
+
+            clique_affinity[a,b,t,k,c] = sum_i affinity[permutations[a][i],permutions[b][i],t,k,c]
+
+    clique_affinity_row_norm : ndarray, shape (N!,N!,T,K,C)
+        clique_affinity normalized across the second dimension
+
+    clique_affinity_col_norm : ndarray, shape (N!,N!,T,K,C)
+        clique_affinity normalized across the first dimension
+        
     """
     def __init__(
         self, parents, kinematics_models, 
@@ -321,77 +470,93 @@ def fit_gimbal_model(dirs, num_states, num_iters):
 
 
 
-def make_gimbal2D_params(
-    *, parents, node_order,
-    indices_egocentric,
-    obs_outlier_variance,
-    obs_inlier_variance,
-    pos_dt_variance,
-    radii, radii_std,
-    pis, mus, kappas,
-    num_leapfrog_steps,
-    hmc_step_size,
-    **kwargs):
+def make_gimbal_params(
+    parents, num_leapfrog_steps, hmc_step_size,
+    obs_outlier_variance, obs_inlier_variance, pos_dt_variance,
+    indices_egocentric=None, radii=None, radii_std=None, pis=None,
+    mus=None, kappas=None, camera_matrices=None, **kwargs):
     
-    num_joints = len(node_order)
-    return {
-        'crf_keypoints': jnp.array(indices_egocentric),
+    num_joints = len(parents)
+
+    params = {
+        'parents': jnp.array(parents),
+        'pos_dt_variance': jnp.ones(num_joints)*pos_dt_variance,
         'obs_inlier_location': jnp.zeros((num_joints,2)),
         'obs_outlier_location': jnp.zeros((num_joints,2)),
         'obs_outlier_variance': jnp.ones(num_joints)*obs_outlier_variance,
-        'obs_inlier_variance': jnp.ones(num_joints)*obs_inlier_variance,
-        'pos_radius': jnp.array(radii),
-        'pos_radial_variance': jnp.array([1e8,*radii_std[1:]**2]),
-        'parents': jnp.array(parents),
-        'pos_dt_variance': jnp.ones(num_joints)*pos_dt_variance,
-        'state_probability': jnp.array(pis),
-        'state_directions': jnp.array(mus),
-        'state_concentrations': jnp.array(kappas),
-        'state_transition_count': jnp.ones(len(pis)),
+        'obs_inlier_variance': jnp.ones(num_joints)*obs_inlier_variance,  
         'obs_outlier_covariance': jnp.tile(jnp.eye(2),(num_joints,1,1))*obs_outlier_variance,
-        'obs_inlier_covariance': jnp.tile(jnp.eye(2),(num_joints,1,1))*obs_inlier_variance,
+        'obs_inlier_covariance': jnp.tile(jnp.eye(2),(num_joints,1,1))*obs_inlier_variance,  
         'num_leapfrog_steps': num_leapfrog_steps, 
-        'step_size': hmc_step_size }
+        'step_size': hmc_step_size}
 
+    if indices_egocentric is not None:
+        params['crf_keypoints'] = jnp.array(indices_egocentric)
+    if radii is not None:
+        params['pos_radius'] = jnp.array(radii)
+    if radii_std is not None:
+        params['pos_radial_variance'] = jnp.array([1e8,*radii_std[1:]**2])
+    if pis is not None:
+        params['state_probability'] = jnp.array(pis)
+        params['state_transition_count'] = jnp.ones(len(pis))
+    if mus is not None:
+        params['state_directions'] = jnp.array(mus)
+    if kappas is not None:
+        params['state_concentrations'] = jnp.array(kappas)
+    if camera_matrices is not None:
+        params['camera_matrices'] = camera_matrices
+        
+    return params
 
 
 class Gimbal3D:
-    def __init__(self, params, hmc_options):
+    def __init__(self, params, model_type='full'):
+        if model_type == 'full':
+            self.mcmc = gimbal.mcmc3d_full
+        elif model_type == 'simple':
+            self.mcmc = gimbal.mcmc3d_simple
+        else:
+            raise ValueError(f'Unknown model type: {model_type}')
+
         self.seed = jr.PRNGKey(0)
-        params = gimbal.mcmc.initialize_parameters(params)
-        self.params = self.augment_params(params)
-        self.hmc_options = hmc_options
+        self.params = self.mcmc.initialize_parameters(params)
         self.samples = None
         
-    def augment_params(self, params):
-        params['obs_inlier_precision'] = jnp.linalg.inv(params['obs_inlier_covariance'])
-        params['obs_outlier_precision'] = jnp.linalg.inv(params['obs_outlier_covariance'])
-        return params
+    def initialize(self, obs, outlier_prob, outlier_threshold=0.5):
+        missing = outlier_prob[...,na] > outlier_threshold
+        masked_obs = jnp.where(missing, jnp.nan, obs)
+
+        init_pos = gimbal.util.opencv_triangulate(
+            sort_model.kinematics_models[0].params['camera_matrices'], 
+            np.moveaxis(masked_obs, 2, 0))
+
+        init_pos = interpolate_keypoints(
+            init_pos, jnp.isnan(init_pos).any(-1), axis=0)
         
-    def initialize(self, obs, outlier_prob):
-        self.samples = []
-        for i in range(obs.shape[0]):
-            self.params['obs_outlier_probability'] = \
-                jnp.swapaxes(outlier_prob[i], -2, -1)
-            self.samples.append(gimbal.mcmc.initialize(
-                self.seed, self.params, jnp.swapaxes(obs[i], -2, -3)))
+        self.samples = self.mcmc.initialize(
+            self.seed, self.params, jnp.swapaxes(obs, -2, -3),
+            jnp.swapaxes(outlier_prob, -2, -1), init_positions=init_pos)
                 
     def step(self, obs, outlier_prob, **kwargs):
         assert self.samples is not None, 'Must run `Gimbal.initialize first'
         self.seed = jr.split(self.seed)[0]
-        for i in range(obs.shape[0]):
-            self.params['obs_outlier_probability'] = \
-                jnp.swapaxes(outlier_prob[i], -2, -1)
-            self.samples[i] = gimbal.mcmc.step(
-                self.seed, self.params, jnp.swapaxes(obs[i], -2, -3), 
-                self.samples[i], **self.hmc_options)
+        self.samples = self.mcmc.step(
+            self.seed, self.params, 
+            jnp.swapaxes(obs, -2, -3),
+            jnp.swapaxes(outlier_prob, -2, -1),
+            self.samples)
     
     def obs_log_likelihood(self, obs, outlier_prob):
-        pred = jnp.stack([jax.vmap(gimbal.mcmc.project, in_axes=(0,None), out_axes=-3)(
-            self.params['camera_matrices'], s['positions']) for s in self.samples])
+        pred = jax.vmap(self.mcmc.project, in_axes=(0,None), out_axes=-3)(
+            self.params['camera_matrices'], self.samples['positions'])
         err = pred-jnp.moveaxis(obs, -2, -3)
-        inlier_lp = gaussian_log_prob(err, self.params['obs_inlier_location'], self.params['obs_inlier_precision'])
-        outlier_lp = gaussian_log_prob(err, self.params['obs_outlier_location'], self.params['obs_outlier_precision'])
+
+        inlier_lp = tfd.MultivariateNormalFullCovariance(
+            self.params['obs_inlier_location'], self.params['obs_inlier_covariance']).log_prob(err)
+        
+        outlier_lp = tfd.MultivariateNormalFullCovariance(
+            self.params['obs_outlier_location'], self.params['obs_outlier_covariance']).log_prob(err)
+
         outlier_prob = jnp.swapaxes(outlier_prob, -1, -2)
         prior = jnp.stack([1-outlier_prob, outlier_prob])
         lp = jax.nn.logsumexp(jnp.stack([inlier_lp,outlier_lp]), b=prior, axis=0)
@@ -402,40 +567,31 @@ class Gimbal3D:
 class Gimbal2D:
     def __init__(self, params):
         self.seed = jr.PRNGKey(0)
-        params = gimbal.mcmc2d.initialize_parameters(params)
-        self.params = self.augment_params(params)
+        self.params = gimbal.mcmc2d_full.initialize_parameters(params)
         self.samples = None
         
-    def augment_params(self, params):
-        params['obs_inlier_precision'] = jnp.linalg.inv(params['obs_inlier_covariance'])
-        params['obs_outlier_precision'] = jnp.linalg.inv(params['obs_outlier_covariance'])
-        return params
-        
     def initialize(self, obs, outlier_prob):
-        self.samples = gimbal.mcmc2d.initialize(
+        self.samples = gimbal.mcmc2d_full.initialize(
             self.seed, self.params, obs[...,0,:], outlier_prob[...,0])
                 
     def step(self, obs, outlier_prob, **kwargs):
         assert self.samples is not None, 'Must run `Gimbal.initialize first'
         self.seed = jr.split(self.seed)[0]
-        self.samples = gimbal.mcmc2d.step(
+        self.samples = gimbal.mcmc2d_full.step(
             self.seed, self.params, self.samples, 
             obs[...,0,:], outlier_prob[...,0])
     
     def obs_log_likelihood(self, obs, outlier_prob):
         err = self.samples['positions']-obs[...,0,:]
-        inlier_lp = gaussian_log_prob(err, self.params['obs_inlier_location'], self.params['obs_inlier_precision'])
-        outlier_lp = gaussian_log_prob(err, self.params['obs_outlier_location'], self.params['obs_outlier_precision'])
+     
+        inlier_lp = tfd.MultivariateNormalFullCovariance(
+            self.params['obs_inlier_location'], self.params['obs_inlier_covariance']).log_prob(err)
+        
+        outlier_lp = tfd.MultivariateNormalFullCovariance(
+            self.params['obs_outlier_location'], self.params['obs_outlier_covariance']).log_prob(err)
+
         prior = jnp.stack([1-outlier_prob, outlier_prob])[...,0]
         lp = jax.nn.logsumexp(jnp.stack([inlier_lp,outlier_lp]), b=prior, axis=0)
         return jnp.nan_to_num(lp[...,na])
     
 
-#-----------------------------------------------------------------------------#
-#                              XXX                                            #
-#-----------------------------------------------------------------------------#
-
-
-
-class DummyModel:
-    def initialize(observations, outlier_probabilities): pass
